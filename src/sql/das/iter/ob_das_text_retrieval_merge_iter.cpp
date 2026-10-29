@@ -880,7 +880,9 @@ int ObDASTRTaatIter::check_and_prepare()
   } else if (limit_param_.limit_ > 0 && output_row_cnt_ >= limit_param_.limit_) {
     ret = OB_ITER_END;
   } else if (!doc_cnt_calculated_) {
-    if (OB_FAIL(do_total_doc_cnt())) {
+    if (!ir_ctdef_->need_calc_relevance()) {
+      doc_cnt_calculated_ = true;
+    } else if (OB_FAIL(do_total_doc_cnt())) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
       } else {
         doc_cnt_calculated_ = true;
@@ -941,6 +943,135 @@ int ObDASTRTaatIter::get_next_batch_rows(int64_t &count, int64_t capacity)
   int ret = OB_SUCCESS;
   const bool need_relevance = ir_ctdef_->need_proj_relevance_score();
   int64_t real_capacity = ir_rtdef_->eval_ctx_->max_batch_size_ > 0 ? min(capacity, ir_rtdef_->eval_ctx_->max_batch_size_) : 1;
+  if (ir_ctdef_->is_skip_bm25_score() && !force_return_docid_ && DISJUNCTIVE == relation_type_) {
+    if (capacity > real_capacity || count != 0) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!is_hashmap_inited_ && OB_FAIL(init_stores_by_partition())) {
+    } else if (cur_map_idx_ >= query_tokens_.count()) {
+      ret = OB_ITER_END;
+    }
+    next_written_idx_ = 0;
+    count = 0;
+    const bool is_batch_mode = ir_ctdef_->inv_scan_domain_id_col_->is_batch_result();
+    ObExpr *doc_id_col = ir_ctdef_->inv_scan_domain_id_col_;
+    ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
+    ObDASTRTaatHashMap *map = (hash_map_size_ > 0 && nullptr != hash_maps_) ? hash_maps_[0] : nullptr;
+    while (OB_SUCC(ret) && 0 == count && cur_map_idx_ < query_tokens_.count()) {
+      if (limit_param_.limit_ > 0 && output_row_cnt_ >= limit_param_.limit_) {
+        ret = OB_ITER_END;
+        break;
+      }
+      int64_t scan_cnt = 0;
+      if (is_batch_mode) {
+        ret = token_iters_.at(0)->get_next_rows(scan_cnt, real_capacity);
+        if (OB_ITER_END == ret && scan_cnt > 0) {
+          ret = OB_SUCCESS;
+        }
+      } else {
+        ret = token_iters_.at(0)->get_next_row();
+        if (OB_SUCC(ret)) {
+          scan_cnt = 1;
+        }
+      }
+      if (OB_SUCC(ret) && scan_cnt > 0) {
+        const bool is_single_token = (1 == query_tokens_.count());
+        const bool is_last_token = (cur_map_idx_ == query_tokens_.count() - 1);
+        if (is_batch_mode) {
+          ObDatum *doc_id_proj_datum = doc_id_col->locate_batch_datums(*eval_ctx);
+          for (int64_t i = 0; OB_SUCC(ret) && i < scan_cnt; ++i) {
+            bool keep = false;
+            if (is_single_token) {
+              keep = true;
+            } else {
+              ObDocIdExt doc_id;
+              if (OB_FAIL(doc_id.from_datum(doc_id_proj_datum[i]))) {
+              } else if (is_last_token) {
+                double dummy = 0.0;
+                int tmp_ret = map->get_refactored(doc_id, dummy);
+                if (OB_HASH_NOT_EXIST == tmp_ret) {
+                  keep = true;
+                } else if (OB_SUCCESS != tmp_ret) {
+                  ret = tmp_ret;
+                }
+              } else if (OB_FAIL(map->set_refactored(doc_id, 1.0, 0))) {
+                if (OB_HASH_EXIST == ret) {
+                  ret = OB_SUCCESS;
+                }
+              } else {
+                keep = true;
+              }
+            }
+            if (OB_SUCC(ret) && keep) {
+              ++input_row_cnt_;
+              if (limit_param_.limit_ > 0 && input_row_cnt_ <= limit_param_.offset_) {
+              } else {
+                if (count != i) {
+                  doc_id_proj_datum[count] = doc_id_proj_datum[i];
+                }
+                ++next_written_idx_;
+                ++output_row_cnt_;
+                ++count;
+                if (limit_param_.limit_ > 0 && output_row_cnt_ >= limit_param_.limit_) {
+                  ret = OB_ITER_END;
+                  break;
+                }
+              }
+            }
+          }
+        } else {
+          const ObDatum &doc_id_datum = doc_id_col->locate_expr_datum(*eval_ctx);
+          bool keep = false;
+          if (is_single_token) {
+            keep = true;
+          } else {
+            ObDocIdExt doc_id;
+            if (OB_FAIL(doc_id.from_datum(doc_id_datum))) {
+            } else if (is_last_token) {
+              double dummy = 0.0;
+              int tmp_ret = map->get_refactored(doc_id, dummy);
+              if (OB_HASH_NOT_EXIST == tmp_ret) {
+                keep = true;
+              } else if (OB_SUCCESS != tmp_ret) {
+                ret = tmp_ret;
+              }
+            } else if (OB_FAIL(map->set_refactored(doc_id, 1.0, 0))) {
+              if (OB_HASH_EXIST == ret) {
+                ret = OB_SUCCESS;
+              }
+            } else {
+              keep = true;
+            }
+          }
+          if (OB_SUCC(ret) && keep) {
+            ++input_row_cnt_;
+            if (limit_param_.limit_ > 0 && input_row_cnt_ <= limit_param_.offset_) {
+            } else {
+              ++next_written_idx_;
+              ++output_row_cnt_;
+              ++count;
+              if (limit_param_.limit_ > 0 && output_row_cnt_ >= limit_param_.limit_) {
+                ret = OB_ITER_END;
+              }
+            }
+          }
+        }
+      } else if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        ++cur_map_idx_;
+        if (cur_map_idx_ < query_tokens_.count()) {
+          sql::ObEvalCtx *scan_eval_ctx = ir_rtdef_->get_inv_idx_scan_rtdef()->eval_ctx_;
+          scan_eval_ctx->reuse(scan_eval_ctx->get_batch_size());
+          if (OB_FAIL(token_iters_.at(0)->reuse())) {
+          } else if (OB_FAIL(reset_query_token(query_tokens_.at(cur_map_idx_)))) {
+          } else if (OB_FAIL(token_iters_.at(0)->rescan())) {
+          }
+        } else {
+          ret = OB_ITER_END;
+        }
+      }
+    }
+    return ret;
+  }
   if (capacity > real_capacity || count != 0) {
     ret = OB_ERR_UNEXPECTED;
   } else if (!is_hashmap_inited_ && OB_FAIL(init_stores_by_partition())) {
@@ -1068,6 +1199,34 @@ int ObDASTRTaatIter::init_stores_by_partition()
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(total_doc_cnt_ <= 0 || is_hashmap_inited_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (ir_ctdef_->is_skip_bm25_score() && !force_return_docid_ && DISJUNCTIVE == relation_type_) {
+    hash_map_size_ = (query_tokens_.count() > 1) ? 1 : 0;
+    if (hash_map_size_ > 0 && nullptr == hash_maps_) {
+      void *buf = nullptr;
+      if (OB_ISNULL(buf = mem_context_->get_arena_allocator().alloc(sizeof(ObDASTRTaatHashMap *)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        hash_maps_ = static_cast<ObDASTRTaatHashMap **>(buf);
+        if (OB_ISNULL(buf = mem_context_->get_arena_allocator().alloc(sizeof(ObDASTRTaatHashMap)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          ObDASTRTaatHashMap *hash_map = new(buf) ObDASTRTaatHashMap();
+          const int64_t bkt_cnt = OB_MIN(OB_MAX(total_doc_cnt_ * 2, 1024L), 32768L);
+          if (OB_FAIL(hash_map->create(bkt_cnt, common::ObMemAttr("FTTaatMap")))) {
+          } else {
+            hash_maps_[0] = hash_map;
+          }
+        }
+      }
+    } else if (hash_map_size_ > 0 && nullptr != hash_maps_ && nullptr != hash_maps_[0]) {
+      hash_maps_[0]->clear();
+    }
+    if (OB_SUCC(ret)) {
+      cur_map_idx_ = 0;
+      is_hashmap_inited_ = true;
+      is_chunk_store_inited_ = true;
+    }
+    return ret;
   } else {
     int64_t partition_cnt = force_return_docid_ ? 1 : OB_MIN((total_doc_cnt_- 1) / OB_HASHMAP_DEFAULT_SIZE + 1, OB_MAX_HASHMAP_COUNT);
     hash_map_size_ = partition_cnt;
@@ -1746,7 +1905,9 @@ int ObDASTRDaatIter::inner_get_next_row()
     bool filter_valid = false;
     bool got_valid_document = false;
     bool doc_valid = false;
-    ObExpr *match_filter = ir_ctdef_->need_calc_relevance() ? ir_ctdef_->match_filter_ : nullptr;
+    ObExpr *match_filter = (ir_ctdef_->need_calc_relevance()
+        && !(ir_ctdef_->is_skip_bm25_score() && DISJUNCTIVE == relation_type_))
+        ? ir_ctdef_->match_filter_ : nullptr;
     ObDatum *filter_res = nullptr;
     const bool is_batch = false;
     while (OB_SUCC(ret) && !got_valid_document) {
@@ -1789,7 +1950,9 @@ int ObDASTRDaatIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   } else if (0 == capacity) {
     count = 0;
   } else {
-    ObExpr *match_filter = ir_ctdef_->need_calc_relevance() ? ir_ctdef_->match_filter_ : nullptr;
+    ObExpr *match_filter = (ir_ctdef_->need_calc_relevance()
+        && !(ir_ctdef_->is_skip_bm25_score() && DISJUNCTIVE == relation_type_))
+        ? ir_ctdef_->match_filter_ : nullptr;
     int64_t real_capacity = min(capacity, ir_rtdef_->eval_ctx_->max_batch_size_);
     ObDatum *filter_res = nullptr;
     const bool is_batch = true;
