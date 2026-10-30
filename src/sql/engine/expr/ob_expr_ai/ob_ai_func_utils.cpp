@@ -258,7 +258,12 @@ int ObOllamaUtils::get_header(common::ObIAllocator &allocator,
                               common::ObArray<ObString> &headers) 
 {
   int ret = OB_SUCCESS;
-  // ollama header is empty, do nothing
+  // Ollama 不需要 Authorization（免 API Key），但请求必须带 Content-Type
+  ObString content_type_str("Content-Type: application/json");
+  ObString content_type_c_str;
+  if (OB_FAIL(ob_write_string(allocator, content_type_str, content_type_c_str, true))) {
+  } else if (OB_FAIL(headers.push_back(content_type_c_str))) {
+  }
   return ret;
 }
 
@@ -277,7 +282,9 @@ int ObOllamaUtils::ObOllamaComplete::get_body(common::ObIAllocator &allocator,
                                               common::ObJsonObject *&body) 
 {
   int ret = OB_SUCCESS;
-  if (model.empty() || content.empty()) { 
+  // 2 参数的 ai_complete 只给 prompt，content 为空；此时用 prompt 作为输入
+  ObString input = content.empty() ? prompt : content;
+  if (model.empty() || input.empty()) { 
     ret = OB_INVALID_ARGUMENT;
   } else {
     // {"model": "llama3.1", "prompt": "What is the capital of France?"}
@@ -287,7 +294,7 @@ int ObOllamaUtils::ObOllamaComplete::get_body(common::ObIAllocator &allocator,
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, body_obj))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, model, model_str))) {
     } else if (OB_FAIL(body_obj->add("model", model_str))) {
-    } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, content, content_str))) {
+    } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, input, content_str))) {
     } else if (OB_FAIL(body_obj->add("prompt", content_str))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::compact_json_object(allocator, config, body_obj))) {
     } else {
@@ -1063,6 +1070,8 @@ int ObAIFuncUtils::get_complete_provider(ObIAllocator &allocator, const ObString
     complete_provider = OB_NEWx(ObOpenAIUtils::ObOpenAIComplete, &allocator);
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::DASHSCOPE)) {
     complete_provider = OB_NEWx(ObDashscopeUtils::ObDashscopeComplete, &allocator);
+  } else if (ob_provider_check(provider, ObAIFuncProviderUtils::OLLAMA)) {
+    complete_provider = OB_NEWx(ObOllamaUtils::ObOllamaComplete, &allocator);
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "this provider current is");
@@ -1086,6 +1095,8 @@ int ObAIFuncUtils::get_embed_provider(ObIAllocator &allocator, const ObString &p
     embed_provider = OB_NEWx(ObOpenAIUtils::ObOpenAIEmbed, &allocator);
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::DASHSCOPE)) {
     embed_provider = OB_NEWx(ObDashscopeUtils::ObDashscopeEmbed, &allocator);
+  } else if (ob_provider_check(provider, ObAIFuncProviderUtils::OLLAMA)) {
+    embed_provider = OB_NEWx(ObOllamaUtils::ObOllamaEmbed, &allocator);
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "this provider current is");
@@ -1297,12 +1308,19 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");
   } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_.get_provider(), complete_provider))) {
+    LOG_WARN("[AI_STEP] get_complete_provider failed", K(ret), K(endpoint_info_.get_provider()));
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
+    LOG_WARN("[AI_STEP] get_unencrypted_access_key failed", K(ret));
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
+    LOG_WARN("[AI_STEP] get_header failed", K(ret), K(headers.count()));
   } else if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
+    LOG_WARN("[AI_STEP] get_body failed", K(ret), K(request_model_name), K(prompt));
   } else if (OB_FAIL(client.send_post(*allocator_, endpoint_info_.get_url(), headers, body, response))) {
+    LOG_WARN("[AI_STEP] send_post failed", K(ret), K(endpoint_info_.get_url()));
   } else if (OB_FAIL(complete_provider->parse_output(*allocator_, response, result_base))) {
+    LOG_WARN("[AI_STEP] parse_output failed", K(ret));
   } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, result_base, result_str))) {
+    LOG_WARN("[AI_STEP] print_json_to_str failed", K(ret));
   } else {
     result = result_str;
   }
@@ -1618,17 +1636,49 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
     uint64_t args_count = args_array->element_count();
     int64_t max_result_len = template_str.length();
     char *result_buf = NULL;
+    // 参数文本：字符串直接用，JSON 对象/数组序列化成文本
+    ObSEArray<ObString, 16> arg_texts;
     for (uint64_t i = 0; OB_SUCC(ret) && i < args_count; i++) {
       ObJsonNode *arg_node = args_array->get_value(i);
-      if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_STRING) {
-        ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
-        max_result_len += arg_str->get_str().length();
-      } else {
+      ObString arg_text;
+      if (OB_ISNULL(arg_node)) {
         ret = OB_INVALID_ARGUMENT;
+      } else if (arg_node->json_type() == ObJsonNodeType::J_STRING) {
+        arg_text = static_cast<ObJsonString *>(arg_node)->get_str();
+      } else if (OB_FAIL(arg_node->get_raw_binary(arg_text, &allocator))) {
+      }
+      if (OB_SUCC(ret) && OB_FAIL(arg_texts.push_back(arg_text))) {
+      }
+    }
+    // 按占位符**实际出现次数**计算长度，重复占位符会被替换多次
+    for (uint64_t i = 0; OB_SUCC(ret) && i < args_count; i++) {
+      int64_t occ = 0;
+      int64_t width_sum = 0;
+      const char *tpl = template_str.ptr();
+      const int64_t tlen = template_str.length();
+      for (int64_t k = 0; k < tlen; k++) {
+        if (tpl[k] == '{') {
+          int64_t j = k + 1;
+          int64_t idx = 0;
+          bool has_num = false;
+          while (j < tlen && tpl[j] >= '0' && tpl[j] <= '9') {
+            idx = idx * 10 + (tpl[j] - '0');
+            ++j;
+            has_num = true;
+          }
+          if (has_num && j < tlen && tpl[j] == '}' && static_cast<uint64_t>(idx) == i) {
+            ++occ;
+            width_sum += (j - k + 1);
+            k = j;
+          }
+        }
+      }
+      if (occ > 0) {
+        max_result_len += occ * arg_texts.at(i).length() - width_sum;
       }
     }
     if (OB_FAIL(ret)) {
-    } else if (OB_ISNULL(result_buf = static_cast<char *>(allocator.alloc(max_result_len)))) {
+    } else if (OB_ISNULL(result_buf = static_cast<char *>(allocator.alloc(max_result_len > 0 ? max_result_len : 1)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       int64_t result_pos = 0;
@@ -1665,21 +1715,15 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
             }
             
             if (valid_index && index >= 0 && static_cast<uint64_t>(index) < args_count) {
-              ObJsonNode *arg_node = args_array->get_value(static_cast<uint64_t>(index));
-              if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_STRING) {
-                ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
-                ObString arg_value = arg_str->get_str();
-                
-                if (result_pos + arg_value.length() <= max_result_len) {
+              ObString arg_value = arg_texts.at(static_cast<uint64_t>(index));
+              if (result_pos + arg_value.length() <= max_result_len) {
+                if (arg_value.length() > 0) {
                   MEMCPY(result_buf + result_pos, arg_value.ptr(), arg_value.length());
-                  result_pos += arg_value.length();
-                } else {
-                  ret = OB_BUF_NOT_ENOUGH;
                 }
+                result_pos += arg_value.length();
               } else {
-                //do nothing
+                ret = OB_BUF_NOT_ENOUGH;
               }
-              
               i = end_pos;
             } else {
               ret = OB_INVALID_ARGUMENT;

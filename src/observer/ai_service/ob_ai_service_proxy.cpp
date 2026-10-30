@@ -200,7 +200,9 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "endpoint_name", name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "ai_model_name", ai_model_name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "url", url);
-  EXTRACT_VARCHAR_FIELD_MYSQL(result, "access_key", access_key);
+  // access_key 允许为 NULL（Ollama 等免 API Key 的 provider），
+  // 用带默认值的版本，否则读表时会对 NULL 列直接返回 OB_ERR_NULL_VALUE(-4152)
+  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "access_key", access_key, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "provider", provider, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "request_model_name", request_model_name, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "parameters", arguments, true, false, ""/*wont be used*/);
@@ -212,7 +214,7 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   } else if (OB_FAIL(deep_copy_ob_string(allocator, name, endpoint.name_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, ai_model_name, endpoint.ai_model_name_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, url, endpoint.url_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, access_key, endpoint.access_key_))) {
+  } else if (!access_key.empty() && OB_FAIL(deep_copy_ob_string(allocator, access_key, endpoint.access_key_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, provider, endpoint.provider_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, request_model_name, endpoint.request_model_name_))) {
   } else if (OB_FAIL(deep_copy_ob_string(allocator, arguments, endpoint.parameters_))) {
