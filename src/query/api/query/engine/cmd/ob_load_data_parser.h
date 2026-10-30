@@ -136,6 +136,8 @@ struct ObCSVGeneralFormat {
   common::ObString file_extension_;
   bool parse_header_;
   ObCSVBinaryFormat binary_format_;
+  bool export_header_ = false;
+  common::ObString null_str_ = common::ObString();
   bool ignore_last_empty_col_;
 
   int init_format(const ObDataInFileStruct &format,
