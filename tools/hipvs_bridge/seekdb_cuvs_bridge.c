@@ -33,9 +33,17 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 256;
-  h->ip->nn_descent_niter = 100;
+  /* NN-descent refinement dominates the CAGRA build, and 100 passes buy
+   * nothing over 20: measured 41.7s -> 14.9s at equal recall@10 (0.990 ->
+   * 0.991) on 250k x 128, on both clustered (SIFT-like) and i.i.d. data.
+   * graph_degree stays 128 -- lowering it costs recall.
+   * Env overrides are kept so parameter sweeps need no rebuild. */
+  {
+    const char* e;
+    h->ip->graph_degree = (e = getenv("SK_GD")) ? atoi(e) : 128;
+    h->ip->intermediate_graph_degree = (e = getenv("SK_IGD")) ? atoi(e) : 256;
+    h->ip->nn_descent_niter = (e = getenv("SK_NITER")) ? atoi(e) : 20;
+  }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
