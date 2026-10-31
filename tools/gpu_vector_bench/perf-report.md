@@ -7,12 +7,14 @@ compiled from this repository on that machine. Harnesses and raw methodology:
 
 ## Headline
 
-| change | build phase | whole path (250k) |
-|---|---|---|
-| shipped source | 41.7 s | 61.9 s |
-| this change | **14.9 s** | **33.8 s** |
+Build phase (the lazy CAGRA build at first query), 250k x 128, clustered data:
 
-`nn_descent_niter` 100 → 20. Recall@10 unchanged (0.990 → 0.991).
+| | build phase |
+|---|---|
+| shipped source (niter=100) | 41.7 s |
+| this change (niter=20) | **14.9 s** |
+
+Recall@10 is unchanged within noise: 0.990 → 0.986–0.991 across runs.
 
 GPU vs CPU for the same 250k index:
 
@@ -20,6 +22,21 @@ GPU vs CPU for the same 250k index:
 |---|---|---|
 | `lib=cuvs` (GPU CAGRA) | **14.9 s** | lazily, at the first `APPROXIMATE` query |
 | `lib=vsag` (CPU HNSW) | **235 s** | incrementally, during `INSERT` |
+
+End to end, measured the way the contest baseline is stated (everything up to
+and including the first query -- i.e. excluding the 100 steady queries):
+
+| niter | observer start | DDL | import | first query | **through first query** |
+|---|---|---|---|---|---|
+| 100 | 1.53 s | 0.05 s | 9.46 s | 42.69 s | **53.7 s** |
+| **20** | 1.53 s | 0.05 s | 9.63 s | 14.52 s | **25.7 s** |
+
+Caveat on comparing absolute numbers with the published 20–27 s SIFT250K
+baseline: our data is synthetic. NN-descent convergence depends on intrinsic
+dimensionality, and real SIFT sits far below our 128-d proxies, so a given
+niter is expected to cost less there. Both of our data sets land in the same
+place relative to each other, which is why the report leads with the ratio
+between niter settings rather than with the absolute seconds.
 
 ## Workload
 
@@ -51,9 +68,10 @@ to judge quality, which is why the report uses its own queries.
 | 100 steady queries | 8.01 s | 30 % |
 | **total** | **26.5 s** | |
 
-That total is the same order as the contest's published 20–27 s SIFT250K
-baseline, which is why the tuning below is aimed at the two build-side phases
-rather than at query throughput.
+Through the first query that is 18.4 s of the 26.5 s; the remaining 8 s are the
+100 steady queries, which the contest's "build" figure does not include. Two of
+the five phases (import, lazy build) carry 66 % of the time, so that is where
+the tuning below aims.
 
 Import decomposes further, measured by inserting the identical rows into
 tables with and without a vector index:
@@ -95,6 +113,22 @@ Two conclusions:
 * Reducing `graph_degree` is a bad trade: it is the cheapest option on the
   table (9.2 s) but costs ~8 points of recall. Retrieval quality is a scored
   requirement, so it stays at 128.
+
+A finer sweep confirms 20 is the knee rather than an arbitrary stop:
+
+| niter | build (clustered) | recall@10 | build (random) | recall@10 |
+|---|---|---|---|---|
+| **20** | 14.80 s | **0.986** | 14.61 s | **0.994** |
+| 18 | 14.33 s | 0.985 | — | — |
+| 16 | 13.22 s | 0.981 | 13.26 s | 0.988 |
+| 14 | 12.78 s | 0.975 | — | — |
+| 12 | 11.71 s | 0.968 | — | — |
+| 10 | 11.24 s | 0.972 | — | — |
+
+Going below 20 saves another ~1.5 s (10 %) but costs measurable recall, which
+is not worth it when the quality bar is the scored part. Run-to-run noise on
+the build is about ±0.3 s, so 20 and 18 are indistinguishable in time; 20 is
+kept because it also had the best recall in the sample.
 
 `intermediate_graph_degree` was left at 256; lowering it together with `niter`
 only reproduced the `niter`-only result.
